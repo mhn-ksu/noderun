@@ -4,29 +4,42 @@
 # net-ssh gem can't negotiate modern ciphers
 #
 # Uses `knife search node` to build a list of FQDNs,
-# then runs commands againt them with the SYSTEM ssh binary
-# instead  of Chef's embedded net-ssh.
+# then runs commands against them with the SYSTEM ssh binary
+# instead of Chef's embedded net-ssh.
+#
+# Each host is tried with key-based auth first. If a password is
+# supplied (-w, -W, or NODERUN_SSH_PASS) and a host rejects the key
+# ("Permission denied"), that host is retried with the password via
+# sshpass.
 #
 # Usage:
-#   noderun.ssh -q <QUERY> -c <COMMAND> [options]
+#   noderun.sh -q <QUERY> -c <COMMAND> [options]
 #
 # Required:
-#   -q QUERY      knife serach query, e.g., 'role:web AND chef_environment:prod'
+#   -q QUERY      knife search query, e.g., 'role:web AND chef_environment:prod'
 #   -c COMMAND    Command (or ; / && chain) to run on each node
 #
 # Options:
-#   -a ATTRIBUTE  Node attributes to use as hostname (default: fqdn)
-#   -u USER       SSH use (default: current user)
-#   -i IDENTITY   Path to SSH private ksy
-#   -p PARALLEL   Max concurent SSH sessions (default: 10)
-#   -o SSH_OPTS   Extra raw options pass to ssh, e.g., -o "-p 2222"
+#   -a ATTRIBUTE  Node attribute to use as hostname (default: fqdn)
+#   -u USER       SSH user (default: current user)
+#   -i IDENTITY   Path to SSH private key
+#   -p PARALLEL   Max concurrent SSH sessions (default: 10)
+#   -t TIMEOUT    SSH connect timeout in seconds (default: 10)
+#   -o SSH_OPTS   Extra raw options passed to ssh, e.g., -o "-p 2222"
+#   -W            Prompt (hidden input) for an SSH password to fall back on
+#   -w PASSWORD   SSH password to fall back on (visible in ps/shell history;
+#                 prefer -W or the NODERUN_SSH_PASS environment variable)
 #   -n            Dry run: print the node list from knife search and exit
 #   -y            Skip the confirmation prompt
 #   -h            Show this help message
 #
+# Environment:
+#   NODERUN_SSH_PASS  Fallback SSH password (used if -w/-W not given)
+#
 # Examples:
 #   noderun.sh -q "role:webserver AND chef_environment:prod" -c "uptime"
 #   noderun.sh -q "tags:needs_patch" -c "sudo yum update -y" -p 10 -u chefadmin
+#   noderun.sh -q "role:legacy" -c "uptime" -u chefadmin -W
 #   noderun.sh -q "recipe:apache24" -a fqdn -n
 #
 set -euo pipefail
@@ -41,13 +54,16 @@ DRY_RUN=0
 ASSUME_YES=0
 QUERY=""
 COMMAND=""
+SSH_PASSWORD="${NODERUN_SSH_PASS:-}"
+PROMPT_PASSWORD=0
 
 usage() {
-  sed -n '2,29p' "$0" | sed 's/^# \{0,1}//'
+  # Print the leading comment block (minus the shebang) as help text
+  awk 'NR==1 {next} /^#/ {sub(/^# ?/, ""); print; next} {exit}' "$0"
   exit "${1:-1}"
 }
 
-while getopts ":q:c:a:u:i:p:t:o:nyh" opt; do
+while getopts ":q:c:a:u:i:p:t:o:w:Wnyh" opt; do
   case "$opt" in
     q) QUERY="$OPTARG" ;;
     c) COMMAND="$OPTARG" ;;
@@ -57,6 +73,8 @@ while getopts ":q:c:a:u:i:p:t:o:nyh" opt; do
     p) PARALLEL="$OPTARG" ;;
     t) TIMEOUT="$OPTARG" ;;
     o) EXTRA_SSH_OPTS="$OPTARG" ;;
+    w) SSH_PASSWORD="$OPTARG" ;;
+    W) PROMPT_PASSWORD=1 ;;
     n) DRY_RUN=1 ;;
     y) ASSUME_YES=1 ;;
     h) usage 0 ;;
@@ -78,7 +96,16 @@ for bin in knife jq ssh; do
   command -v "$bin" >/dev/null 2>&1 || { echo "Error: '$bin' not found in PATH" >&2; exit 1; }
 done
 
-echo "Querying Chef server: knife serach node \"$QUERY\" -a $ATTRIBUTE" >&2
+# sshpass is only needed if a password may be used
+if [[ "$DRY_RUN" -eq 0 && ( "$PROMPT_PASSWORD" -eq 1 || -n "$SSH_PASSWORD" ) ]]; then
+  command -v sshpass >/dev/null 2>&1 || {
+    echo "Error: password fallback requested but 'sshpass' not found in PATH" >&2
+    echo "       (install it, e.g. 'sudo yum install sshpass' or 'sudo apt install sshpass')" >&2
+    exit 1
+  }
+fi
+
+echo "Querying Chef server: knife search node \"$QUERY\" -a $ATTRIBUTE" >&2
 
 SEARCH_JSON="$(knife search node "$QUERY" -a "$ATTRIBUTE" -F json 2>/tmp/noderun.knife.err)" || {
   echo "Error: knife search failed:" >&2
@@ -131,18 +158,42 @@ if [[ "$ASSUME_YES" -eq 0 ]]; then
   esac
 fi
 
+if [[ "$PROMPT_PASSWORD" -eq 1 ]]; then
+  read -r -s -p "SSH password (fallback if key auth fails): " SSH_PASSWORD
+  echo ""
+  if [[ -z "$SSH_PASSWORD" ]]; then
+    echo "Warning: empty password entered; password fallback disabled." >&2
+  fi
+fi
+
+# Key-auth options: BatchMode keeps ssh from ever prompting
 SSH_BASE_OPTS=(-o BatchMode=yes -o ConnectTimeout="$TIMEOUT" -o StrictHostKeyChecking=accept-new)
 [[ -n "$IDENTITY" ]] && SSH_BASE_OPTS+=(-i "$IDENTITY")
+
+# Password-auth options: separate array because ssh uses the FIRST value
+# it sees for an option, so BatchMode=yes can't be overridden later
+SSH_PW_OPTS=(-o BatchMode=no -o ConnectTimeout="$TIMEOUT" -o StrictHostKeyChecking=accept-new -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive -o NumberOfPasswordPrompts=1)
+
 if [[ -n "$EXTRA_SSH_OPTS" ]]; then
   # shellcheck disable=SC2206
   SSH_BASE_OPTS+=($EXTRA_SSH_OPTS)
+  # shellcheck disable=SC2206
+  SSH_PW_OPTS+=($EXTRA_SSH_OPTS)
 fi
 
 RESULT_DIR="$(mktemp -d)"
 trap 'rm -rf "$RESULT_DIR"' EXIT
 
 SSH_BASE_OPTS_STR="${SSH_BASE_OPTS[*]}"
-export SSH_USER COMMAND SSH_BASE_OPTS_STR RESULT_DIR
+SSH_PW_OPTS_STR="${SSH_PW_OPTS[*]}"
+export SSH_USER COMMAND SSH_BASE_OPTS_STR SSH_PW_OPTS_STR RESULT_DIR
+
+# sshpass -e reads the password from $SSHPASS, which keeps it out of
+# the process list (unlike sshpass -p)
+if [[ -n "$SSH_PASSWORD" ]]; then
+  export SSHPASS="$SSH_PASSWORD"
+fi
+unset SSH_PASSWORD
 
 run_one() {
   local host="$1"
@@ -154,13 +205,30 @@ run_one() {
 
   local out
   local rc
-  if out=$(ssh "${ssh_opts[@]}" "$target" -- "$COMMAND" 2>&1); then
+  if out=$(ssh "${ssh_opts[@]}" "$target" -- "$COMMAND" 2>&1 </dev/null); then
     rc=0
   else
     rc=$?
   fi
 
-  # Prefix every out line with the hostname, like knife ssh did.
+  # Fall back to password auth only when the host was reachable but
+  # rejected key auth (rc 255 + "Permission denied"). Unreachable hosts,
+  # DNS failures, timeouts, etc. are not retried.
+  if [[ "$rc" -eq 255 && -n "${SSHPASS:-}" ]] && grep -qiE 'permission denied|too many authentication failures' <<< "$out"; then
+    # shellcheck disable=SC2206
+    local ssh_pw_opts=($SSH_PW_OPTS_STR)
+    if out=$(sshpass -e ssh "${ssh_pw_opts[@]}" "$target" -- "$COMMAND" 2>&1 </dev/null); then
+      rc=0
+    else
+      rc=$?
+      # sshpass exit 5 = password rejected
+      [[ "$rc" -eq 5 ]] && out="${out:+$out$'\n'}[password authentication failed]"
+    fi
+    touch "$RESULT_DIR/$host.pw"
+    printf '%-40s | [key auth rejected; used password auth]\n' "$host" >&2
+  fi
+
+  # Prefix every output line with the hostname, like knife ssh did.
   if [[ -n "$out" ]]; then
     while IFS= read -r line; do
       printf '%-40s | %s\n' "$host" "$line"
@@ -205,5 +273,13 @@ for f in "$RESULT_DIR"/*.rc; do
   [[ "$rc" -ne 0 ]] && FAIL_COUNT=$((FAIL_COUNT + 1))
 done
 
+PW_COUNT=0
+for f in "$RESULT_DIR"/*.pw; do
+  [[ -e "$f" ]] && PW_COUNT=$((PW_COUNT + 1))
+done
+
 echo ""
-echo "Done. $TOTAL node(s) targets. $((TOTAL - FAIL_COUNT)) succeeded, $FAIL_COUNT failed."
+echo "Done. $TOTAL node(s) targeted. $((TOTAL - FAIL_COUNT)) succeeded, $FAIL_COUNT failed."
+if [[ "$PW_COUNT" -gt 0 ]]; then
+  echo "$PW_COUNT node(s) required password fallback (consider deploying your key to them)."
+fi
