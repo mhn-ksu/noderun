@@ -11,11 +11,6 @@ Clone this repository to your workstation. Put `noderun.sh` on your $PATH.
 
 `noderun.sh -h` will display a usage message.
 
-## Caveat
-This relies on there being a functional SSH key pair between the workstation
-where `noderun.sh` is executed and the target nodes. It doesn't do password
-authentication.
-
 This utility was created with the help of ChatGPT and Claude.
 
 Presented as-is, your mileage may vary, void where prohibited, may cause drowsiness, operating heavy machinery is fun, please fold, spindle, or mutilate.
