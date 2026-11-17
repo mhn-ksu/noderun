@@ -12,6 +12,11 @@
 # ("Permission denied"), that host is retried with the password via
 # sshpass.
 #
+# By default only the command's own output is shown inline. SSH
+# connection errors (DNS, timeouts, auth failures), login banners and
+# exit codes are collected into a summary at the end. Use -v to show
+# them inline as well.
+#
 # Usage:
 #   noderun.sh -q <QUERY> -c <COMMAND> [options]
 #
@@ -29,6 +34,7 @@
 #   -W            Prompt (hidden input) for an SSH password to fall back on
 #   -w PASSWORD   SSH password to fall back on (visible in ps/shell history;
 #                 prefer -W or the NODERUN_SSH_PASS environment variable)
+#   -v            Verbose: show ssh messages, banners and exit codes inline
 #   -n            Dry run: print the node list from knife search and exit
 #   -y            Skip the confirmation prompt
 #   -h            Show this help message
@@ -56,6 +62,7 @@ QUERY=""
 COMMAND=""
 SSH_PASSWORD="${NODERUN_SSH_PASS:-}"
 PROMPT_PASSWORD=0
+VERBOSE=0
 
 usage() {
   # Print the leading comment block (minus the shebang) as help text
@@ -63,7 +70,7 @@ usage() {
   exit "${1:-1}"
 }
 
-while getopts ":q:c:a:u:i:p:t:o:w:Wnyh" opt; do
+while getopts ":q:c:a:u:i:p:t:o:w:Wvnyh" opt; do
   case "$opt" in
     q) QUERY="$OPTARG" ;;
     c) COMMAND="$OPTARG" ;;
@@ -75,6 +82,7 @@ while getopts ":q:c:a:u:i:p:t:o:w:Wnyh" opt; do
     o) EXTRA_SSH_OPTS="$OPTARG" ;;
     w) SSH_PASSWORD="$OPTARG" ;;
     W) PROMPT_PASSWORD=1 ;;
+    v) VERBOSE=1 ;;
     n) DRY_RUN=1 ;;
     y) ASSUME_YES=1 ;;
     h) usage 0 ;;
@@ -181,12 +189,21 @@ if [[ -n "$EXTRA_SSH_OPTS" ]]; then
   SSH_PW_OPTS+=($EXTRA_SSH_OPTS)
 fi
 
+# Quiet mode: LogLevel=ERROR hides login banners and warnings such as
+# "Permanently added ... to the list of known hosts". Added after the
+# -o extras so a LogLevel passed there takes precedence (ssh keeps the
+# first value it sees).
+if [[ "$VERBOSE" -eq 0 ]]; then
+  SSH_BASE_OPTS+=(-o LogLevel=ERROR)
+  SSH_PW_OPTS+=(-o LogLevel=ERROR)
+fi
+
 RESULT_DIR="$(mktemp -d)"
 trap 'rm -rf "$RESULT_DIR"' EXIT
 
 SSH_BASE_OPTS_STR="${SSH_BASE_OPTS[*]}"
 SSH_PW_OPTS_STR="${SSH_PW_OPTS[*]}"
-export SSH_USER COMMAND SSH_BASE_OPTS_STR SSH_PW_OPTS_STR RESULT_DIR
+export SSH_USER COMMAND SSH_BASE_OPTS_STR SSH_PW_OPTS_STR RESULT_DIR VERBOSE
 
 # sshpass -e reads the password from $SSHPASS, which keeps it out of
 # the process list (unlike sshpass -p)
@@ -214,28 +231,63 @@ run_one() {
   # Fall back to password auth only when the host was reachable but
   # rejected key auth (rc 255 + "Permission denied"). Unreachable hosts,
   # DNS failures, timeouts, etc. are not retried.
+  local used_pw=0
   if [[ "$rc" -eq 255 && -n "${SSHPASS:-}" ]] && grep -qiE 'permission denied|too many authentication failures' <<< "$out"; then
     # shellcheck disable=SC2206
     local ssh_pw_opts=($SSH_PW_OPTS_STR)
+    used_pw=1
+    touch "$RESULT_DIR/$host.pw"
     if out=$(sshpass -e ssh "${ssh_pw_opts[@]}" "$target" -- "$COMMAND" 2>&1 </dev/null); then
       rc=0
     else
       rc=$?
-      # sshpass exit 5 = password rejected
-      [[ "$rc" -eq 5 ]] && out="${out:+$out$'\n'}[password authentication failed]"
     fi
-    touch "$RESULT_DIR/$host.pw"
-    printf '%-40s | [key auth rejected; used password auth]\n' "$host" >&2
+  fi
+
+  # Decide whether a failure came from ssh itself (connection/auth) or
+  # from the remote command. ssh uses 255 for its own errors, sshpass
+  # uses 5 for a rejected password and 6 for an unknown host key. A
+  # remote command can also exit 255, so we only call it an ssh failure
+  # when the output looks like an ssh error message.
+  local conn_reason=""
+  if [[ "$used_pw" -eq 1 && "$rc" -eq 5 ]]; then
+    conn_reason="password rejected"
+  elif [[ "$used_pw" -eq 1 && "$rc" -eq 6 ]]; then
+    conn_reason="host key unknown (sshpass)"
+  elif [[ "$rc" -eq 255 ]]; then
+    case "$out" in
+      *"Could not resolve hostname"*)            conn_reason="DNS lookup failed" ;;
+      *"Connection timed out"*|*"Operation timed out"*) conn_reason="connection timed out" ;;
+      *"Connection refused"*)                   conn_reason="connection refused" ;;
+      *"No route to host"*)                     conn_reason="no route to host" ;;
+      *"Network is unreachable"*)               conn_reason="network unreachable" ;;
+      *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION HAS CHANGED"*) conn_reason="host key mismatch" ;;
+      *"Permission denied"*|*"Too many authentication failures"*)
+        if [[ -n "${SSHPASS:-}" ]]; then conn_reason="key and password auth failed"; else conn_reason="key auth failed (no password given)"; fi ;;
+      *"Connection closed"*|*"Connection reset"*|*"kex_exchange_identification"*) conn_reason="connection closed by remote host" ;;
+      ssh:*|*$'\n'ssh:*)                        conn_reason="$(grep -m1 '^ssh:' <<< "$out" | sed 's/^ssh: //')" ;;
+    esac
+  fi
+
+  if [[ -n "$conn_reason" ]]; then
+    echo "$conn_reason" > "$RESULT_DIR/$host.conn"
+  elif [[ "$rc" -ne 0 ]]; then
+    echo "$rc" > "$RESULT_DIR/$host.cmdfail"
   fi
 
   # Prefix every output line with the hostname, like knife ssh did.
-  if [[ -n "$out" ]]; then
+  # In quiet mode, ssh's own error text is withheld (it's summarized
+  # at the end instead); only real command output is shown.
+  if [[ "$VERBOSE" -eq 1 && "$used_pw" -eq 1 ]]; then
+    printf '%-40s | [key auth rejected; used password auth]\n' "$host" >&2
+  fi
+  if [[ -n "$out" && ( -z "$conn_reason" || "$VERBOSE" -eq 1 ) ]]; then
     while IFS= read -r line; do
       printf '%-40s | %s\n' "$host" "$line"
     done <<< "$out"
   fi
 
-  if [[ "$rc" -ne 0 ]]; then
+  if [[ "$VERBOSE" -eq 1 && "$rc" -ne 0 ]]; then
     printf '%-40s | [EXIT CODE %s]\n' "$host" "$rc" >&2
   fi
 
@@ -273,13 +325,35 @@ for f in "$RESULT_DIR"/*.rc; do
   [[ "$rc" -ne 0 ]] && FAIL_COUNT=$((FAIL_COUNT + 1))
 done
 
-PW_COUNT=0
-for f in "$RESULT_DIR"/*.pw; do
-  [[ -e "$f" ]] && PW_COUNT=$((PW_COUNT + 1))
-done
+# print_section TITLE EXT [FORMAT]
+# Lists every host that has a $RESULT_DIR/<host>.<EXT> file, sorted,
+# with the file's contents as the detail column.
+print_section() {
+  local title="$1" ext="$2" fmt="${3:-%s}"
+  local files=("$RESULT_DIR"/*."$ext")
+  [[ -e "${files[0]}" ]] || return 0
+  echo ""
+  echo "$title (${#files[@]}):"
+  local f host detail
+  for f in "${files[@]}"; do
+    host="$(basename "$f" ".$ext")"
+    detail="$(cat "$f")"
+    # shellcheck disable=SC2059
+    printf "  %-44s $fmt\n" "$host" "$detail"
+  done | sort
+}
 
 echo ""
 echo "Done. $TOTAL node(s) targeted. $((TOTAL - FAIL_COUNT)) succeeded, $FAIL_COUNT failed."
-if [[ "$PW_COUNT" -gt 0 ]]; then
-  echo "$PW_COUNT node(s) required password fallback (consider deploying your key to them)."
+
+print_section "Could not connect" conn
+print_section "Command exited non-zero" cmdfail "exit code %s"
+
+PW_FILES=("$RESULT_DIR"/*.pw)
+if [[ -e "${PW_FILES[0]}" ]]; then
+  echo ""
+  echo "Key auth rejected, password fallback tried (${#PW_FILES[@]}) - consider deploying your key:"
+  for f in "${PW_FILES[@]}"; do
+    printf '  %s\n' "$(basename "$f" .pw)"
+  done | sort
 fi
